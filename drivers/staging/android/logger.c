@@ -3,7 +3,7 @@
  *
  * A Logging Subsystem
  *
- * Copyright (C) 2007-2008 Google, Inc.
+ * Copyright (C) 2016 XiaoMi, Inc.
  *
  * Robert Love <rlove@google.com>
  *
@@ -29,6 +29,7 @@
 #include <linux/time.h>
 #include <linux/vmalloc.h>
 #include <linux/aio.h>
+#include <linux/device.h>
 #include "logger.h"
 
 #include <asm/ioctls.h>
@@ -59,6 +60,8 @@ struct logger_log {
 	size_t			head;
 	size_t			size;
 	struct list_head	logs;
+	long			fusion; /* enable printk */
+	unsigned char		tmpbuf[LOGGER_ENTRY_MAX_PAYLOAD];
 };
 
 static LIST_HEAD(log_list);
@@ -242,7 +245,7 @@ static ssize_t do_read_log_to_user(struct logger_log *log,
  * 'log->buffer' which contains the first entry readable by 'euid'
  */
 static size_t get_next_entry_by_uid(struct logger_log *log,
-		size_t off, uid_t euid)
+		size_t off, kuid_t euid)
 {
 	while (off != log->w_off) {
 		struct logger_entry *entry;
@@ -251,7 +254,7 @@ static size_t get_next_entry_by_uid(struct logger_log *log,
 
 		entry = get_entry_header(log, off, &scratch);
 
-		if (entry->euid == euid)
+		if (uid_eq(entry->euid, euid))
 			return off;
 
 		next_len = sizeof(struct logger_entry) + entry->len;
@@ -490,6 +493,8 @@ static ssize_t logger_aio_write(struct kiocb *iocb, const struct iovec *iov,
 
 	mutex_lock(&log->mutex);
 
+	orig = log->w_off;
+
 	/*
 	 * Fix up any readers, pulling them forward to the first readable
 	 * entry after (what will be) the new write offset. We do this now
@@ -517,6 +522,62 @@ static ssize_t logger_aio_write(struct kiocb *iocb, const struct iovec *iov,
 
 		iov++;
 		ret += nr;
+	}
+
+	if (log->fusion) {
+		const unsigned char *buf;
+		const unsigned char *pri;
+		const unsigned char *tag;
+		const unsigned char *msg;
+		const unsigned char *end;
+
+		/* skip the header part */
+		orig = logger_offset(log, orig + sizeof(struct logger_entry));
+
+		if (log->w_off && orig > log->w_off) {
+			memcpy(log->tmpbuf, log->buffer + orig, log->size - orig);
+			memcpy(log->tmpbuf + log->size - orig, log->buffer, log->w_off);
+			buf = log->tmpbuf;
+		} else /* easy case: ring buffer doesn't wrap */
+			buf = log->buffer + orig;
+
+		/* see __android_log_write:
+		   at system/core/liblog/logd_write.c */
+		switch (buf[0]) {
+		case 0: /* ANDROID_LOG_UNKNOWN */
+		case 1: /* ANDROID_LOG_DEFAULT */
+			pri = KERN_DEFAULT;
+			break;
+		case 2: /* ANDROID_LOG_VERBOSE */
+		case 3: /* ANDROID_LOG_DEBUG */
+			pri = KERN_DEBUG;
+			break;
+		case 4: /* ANDROID_LOG_INFO */
+			pri = KERN_INFO;
+			break;
+		case 5: /* ANDROID_LOG_WARN */
+			pri = KERN_WARNING;
+			break;
+		case 6: /* ANDROID_LOG_ERROR */
+			pri = KERN_ERR;
+			break;
+		case 7: /* ANDROID_LOG_FATAL */
+			pri = KERN_CRIT;
+			break;
+		case 8: /* ANDROID_LOG_SILENT */
+		default:
+			pri = KERN_DEFAULT;
+			break;
+		}
+
+		tag = buf + 1;
+		msg = tag + strlen(tag) + 1;
+		end = msg + strlen(msg) - 1;
+
+		if (*end == '\n')
+			printk("%s%s(%d): %s", pri, tag, current->pid, msg);
+		else
+			printk("%s%s(%d): %s\n", pri, tag, current->pid, msg);
 	}
 
 	mutex_unlock(&log->mutex);
@@ -640,6 +701,7 @@ static unsigned int logger_poll(struct file *file, poll_table *wait)
 static long logger_set_version(struct logger_reader *reader, void __user *arg)
 {
 	int version;
+
 	if (copy_from_user(&version, arg, sizeof(int)))
 		return -EFAULT;
 
@@ -740,6 +802,38 @@ static const struct file_operations logger_fops = {
 	.release = logger_release,
 };
 
+static ssize_t logger_fusion_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct miscdevice *misc = dev_get_drvdata(dev);
+	struct logger_log *log = container_of(misc, struct logger_log, misc);
+	ssize_t status;
+
+	mutex_lock(&log->mutex);
+	status = sprintf(buf, "%ld\n", log->fusion);
+	mutex_unlock(&log->mutex);
+
+	return status;
+}
+
+static ssize_t logger_fusion_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct miscdevice *misc = dev_get_drvdata(dev);
+	struct logger_log *log = container_of(misc, struct logger_log, misc);
+	ssize_t status;
+
+	mutex_lock(&log->mutex);
+	status = strict_strtol(buf, 0, &log->fusion);
+	if (status < 0)
+		log->fusion = 0;
+	mutex_unlock(&log->mutex);
+
+	return status ? : size;
+}
+
+static DEVICE_ATTR(fusion, 0644, logger_fusion_show, logger_fusion_store);
+
 /*
  * Log size must must be a power of two, and greater than
  * (LOGGER_ENTRY_MAX_PAYLOAD + sizeof(struct logger_entry)).
@@ -789,6 +883,8 @@ static int __init create_log(char *log_name, int size)
 		goto out_free_log;
 	}
 
+	device_create_file(log->misc.this_device, &dev_attr_fusion);
+
 	pr_info("created %luK log '%s'\n",
 		(unsigned long) log->size >> 10, log->misc.name);
 
@@ -806,7 +902,7 @@ static int __init logger_init(void)
 {
 	int ret;
 
-	ret = create_log(LOGGER_LOG_MAIN, 256*1024);
+	ret = create_log(LOGGER_LOG_MAIN, 2*1024*1024);
 	if (unlikely(ret))
 		goto out;
 
@@ -818,7 +914,7 @@ static int __init logger_init(void)
 	if (unlikely(ret))
 		goto out;
 
-	ret = create_log(LOGGER_LOG_SYSTEM, 256*1024);
+	ret = create_log(LOGGER_LOG_SYSTEM, 2*1024*1024);
 	if (unlikely(ret))
 		goto out;
 
